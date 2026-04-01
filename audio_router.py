@@ -12,12 +12,12 @@ import numpy as np
 import sounddevice as sd
 from scipy.signal import butter, sosfilt
 import subprocess
-import struct
 import threading
 import queue
 import argparse
 import sys
 import os
+import json
 
 
 DEFAULT_BASS_CUTOFF = 80
@@ -27,15 +27,18 @@ AUDIOTEE_PATH = os.path.expanduser("~/Documents/audiotee/.build/release/audiotee
 
 
 class AudioteeCapture:
-    def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, stereo=True):
+    def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, mute=True):
         self.sample_rate = sample_rate
-        self.stereo = stereo
+        self.mute = mute
         self.proc = None
         self.pcm_queue = queue.Queue(maxsize=16)
         self.running = False
+        self._partial_buffer = b""
 
     def start(self):
         cmd = [AUDIOTEE_PATH, "--stereo"]
+        if self.mute:
+            cmd.append("--mute")
         if self.sample_rate != 48000:
             cmd.extend(["--sample-rate", str(self.sample_rate)])
 
@@ -56,9 +59,16 @@ class AudioteeCapture:
         return None
 
     def _read_metadata(self):
-        import json
+        import select
 
-        while self.running:
+        stderr_fd = self.proc.stderr.fileno()
+        deadline = threading.Event()
+        deadline.wait(timeout=5.0)
+
+        while self.running and self.proc.poll() is None:
+            ready, _, _ = select.select([stderr_fd], [], [], 0.5)
+            if not ready:
+                continue
             line = self.proc.stderr.readline()
             if not line:
                 break
@@ -80,17 +90,31 @@ class AudioteeCapture:
             try:
                 self.pcm_queue.put_nowait(chunk)
             except queue.Full:
-                try:
-                    self.pcm_queue.get_nowait()
-                    self.pcm_queue.put_nowait(chunk)
-                except:
-                    pass
+                self.pcm_queue.get_nowait()
+                self.pcm_queue.put_nowait(chunk)
 
-    def read(self, max_bytes=8192):
-        try:
-            return self.pcm_queue.get(timeout=1.0)
-        except queue.Empty:
-            return None
+    def read(self, min_bytes=8192):
+        while self.running:
+            if self._partial_buffer:
+                chunk = self._partial_buffer
+                self._partial_buffer = b""
+            else:
+                try:
+                    chunk = self.pcm_queue.get(timeout=1.0)
+                except queue.Empty:
+                    return None
+
+            if chunk is None:
+                continue
+
+            if len(chunk) >= min_bytes:
+                result = chunk[:min_bytes]
+                self._partial_buffer = chunk[min_bytes:]
+                return result
+            else:
+                self._partial_buffer += chunk
+
+        return None
 
     def stop(self):
         self.running = False
@@ -98,7 +122,7 @@ class AudioteeCapture:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=3)
-            except:
+            except Exception:
                 self.proc.kill()
 
 
@@ -114,7 +138,7 @@ class AudioRouter:
     ):
         self.sample_rate = sample_rate
         self.bass_cutoff = bass_cutoff
-        self.delay_samples = int(delay_ms * sample_rate / 1000)
+        self.delay_samples = max(1, int(delay_ms * sample_rate / 1000))
 
         self.delay_buffer = np.zeros((self.delay_samples, 2))
         self.delay_write_pos = 0
@@ -127,6 +151,7 @@ class AudioRouter:
         self.bass_output_device = bass_output_device
         self.mute = mute
 
+        self.full_queue = queue.Queue(maxsize=8)
         self.bass_queue = queue.Queue(maxsize=8)
         self.running = False
 
@@ -137,7 +162,7 @@ class AudioRouter:
     def _device_name(self, device_id):
         try:
             return sd.query_devices(device_id)["name"]
-        except:
+        except Exception:
             return f"Device {device_id}"
 
     def _print_config(self, full, bass, cutoff, delay, rate):
@@ -202,9 +227,8 @@ class AudioRouter:
 
     def run(self):
         self.running = True
-        self.full_queue = queue.Queue(maxsize=8)
 
-        capture = AudioteeCapture(sample_rate=self.sample_rate)
+        capture = AudioteeCapture(sample_rate=self.sample_rate, mute=self.mute)
         print("Starting audiotee (Core Audio Taps)...")
         metadata = capture.start()
         if metadata:
@@ -218,9 +242,8 @@ class AudioRouter:
         full_thread.start()
         bass_thread.start()
 
-        samples_per_chunk = int(self.sample_rate * 0.02)
         bytes_per_sample = 4
-        bytes_per_chunk = samples_per_chunk * 2 * bytes_per_sample
+        bytes_per_chunk = int(self.sample_rate * 0.02) * 2 * bytes_per_sample
 
         try:
             while self.running:
@@ -228,32 +251,21 @@ class AudioRouter:
                 if raw is None:
                     continue
 
-                if len(raw) < bytes_per_chunk:
-                    continue
-
-                audio = np.frombuffer(raw[:bytes_per_chunk], dtype=np.float32).reshape(
-                    -1, 2
-                )
+                audio = np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)
 
                 delayed_full, bass = self.process_chunk(audio)
 
                 try:
                     self.full_queue.put_nowait(delayed_full)
                 except queue.Full:
-                    try:
-                        self.full_queue.get_nowait()
-                        self.full_queue.put_nowait(delayed_full)
-                    except:
-                        pass
+                    self.full_queue.get_nowait()
+                    self.full_queue.put_nowait(delayed_full)
 
                 try:
                     self.bass_queue.put_nowait(bass)
                 except queue.Full:
-                    try:
-                        self.bass_queue.get_nowait()
-                        self.bass_queue.put_nowait(bass)
-                    except:
-                        pass
+                    self.bass_queue.get_nowait()
+                    self.bass_queue.put_nowait(bass)
 
         except KeyboardInterrupt:
             print("\nStopping...")
@@ -261,11 +273,11 @@ class AudioRouter:
             self.running = False
             try:
                 self.full_queue.put_nowait(None)
-            except:
+            except Exception:
                 pass
             try:
                 self.bass_queue.put_nowait(None)
-            except:
+            except Exception:
                 pass
             full_thread.join(timeout=2)
             bass_thread.join(timeout=2)
