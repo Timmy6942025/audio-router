@@ -5,20 +5,17 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> Checking prerequisites..."
 
-if ! command -v swift &>/dev/null; then
-    echo "ERROR: Swift not found. Install Xcode Command Line Tools:"
-    echo "  xcode-select --install"
-    exit 1
-fi
-
 if ! command -v python3 &>/dev/null; then
     echo "ERROR: Python 3 not found."
     exit 1
 fi
 
-echo "==> Building audiotee (Swift)..."
-cd "$REPO_DIR/vendor/audiotee"
-swift build -c release
+if [[ "$(uname -m)" != "arm64" ]]; then
+    echo "ERROR: Only Apple Silicon (M1/M2/M3/M4) is supported."
+    echo "For Intel Macs, build audiotee from source:"
+    echo "  cd vendor/audiotee && swift build -c release"
+    exit 1
+fi
 
 echo "==> Installing Python dependencies..."
 pip3 install -r "$REPO_DIR/requirements.txt"

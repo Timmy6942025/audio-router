@@ -44,8 +44,8 @@ System Audio
 ## Requirements
 
 - **macOS 14.2+** (Core Audio Taps API)
+- **Apple Silicon Mac** (M1/M2/M3/M4)
 - **Python 3.10+**
-- **Swift 5.9+** (to build audiotee)
 - **Screen and System Audio Recording** permission for your terminal app
 
 ## Quick Start
@@ -53,7 +53,7 @@ System Audio
 ### One-command setup
 
 ```bash
-git clone --recursive https://github.com/Timmy6942025/audio-router.git
+git clone https://github.com/Timmy6942025/audio-router.git
 cd audio-router
 ./setup.sh
 ```
@@ -157,9 +157,8 @@ The tapped audio is still playing from its original source. Use the default mute
 ```
 audio-router/
 ├── bin/
-│   └── audio_router.py      # Main Python script
-├── vendor/
-│   └── audiotee/            # Submodule: Core Audio Taps CLI
+│   ├── audio_router.py      # Main Python script
+│   └── audiotee             # Prebuilt binary (Apple Silicon)
 ├── setup.sh                  # One-command setup
 ├── requirements.txt          # Python dependencies
 ├── LICENSE                   # MIT
