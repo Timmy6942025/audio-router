@@ -23,7 +23,14 @@ import json
 DEFAULT_BASS_CUTOFF = 80
 DEFAULT_DELAY_MS = 150
 DEFAULT_SAMPLE_RATE = 48000
-AUDIOTEE_PATH = os.path.expanduser("~/Documents/audiotee/.build/release/audiotee")
+AUDIOTEE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "vendor",
+    "audiotee",
+    ".build",
+    "release",
+    "audiotee",
+)
 
 
 class AudioteeCapture:

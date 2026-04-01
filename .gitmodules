@@ -1,0 +1,3 @@
+[submodule "vendor/audiotee"]
+	path = vendor/audiotee
+	url = https://github.com/makeusabrew/audiotee.git

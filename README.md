@@ -50,22 +50,15 @@ System Audio
 
 ## Quick Start
 
-### 1. Build audiotee
+### One-command setup
 
 ```bash
-cd ~
-git clone https://github.com/makeusabrew/audiotee.git
-cd audiotee
-swift build -c release
+git clone --recursive https://github.com/Timmy6942025/audio-router.git
+cd audio-router
+./setup.sh
 ```
 
-### 2. Install Python dependencies
-
-```bash
-pip3 install sounddevice numpy scipy
-```
-
-### 3. Find your output device IDs
+### Find your output device IDs
 
 ```bash
 python3 bin/audio_router.py --list
@@ -81,7 +74,7 @@ ID   Name                           In   Out  Rate
 3    Multi-Output Device            0    2    44100
 ```
 
-### 4. Run the router
+### Start routing
 
 ```bash
 python3 bin/audio_router.py --full 1 --bass 2
@@ -158,6 +151,20 @@ Lower the crossover frequency (`--cutoff 60`) or increase your Bluetooth speaker
 ### Hear audio twice (echo)
 
 The tapped audio is still playing from its original source. Use the default mute behavior, or ensure you're not routing through a Multi-Output Device that includes the original output.
+
+## Project Structure
+
+```
+audio-router/
+├── bin/
+│   └── audio_router.py      # Main Python script
+├── vendor/
+│   └── audiotee/            # Submodule: Core Audio Taps CLI
+├── setup.sh                  # One-command setup
+├── requirements.txt          # Python dependencies
+├── LICENSE                   # MIT
+└── README.md
+```
 
 ## License
 
