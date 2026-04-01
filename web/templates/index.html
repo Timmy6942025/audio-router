@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Router</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, monospace; padding: 20px; max-width: 600px; margin: 0 auto; background: #111; color: #eee; }
+h1 { font-size: 18px; margin-bottom: 20px; }
+label { display: block; margin: 12px 0 4px; font-size: 13px; color: #888; }
+select, input[type=number] { width: 100%; padding: 8px; background: #222; border: 1px solid #333; color: #eee; border-radius: 4px; font-size: 14px; }
+input[type=checkbox] { width: auto; }
+button { padding: 10px 20px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }
+#startBtn { background: #2a2; color: #fff; }
+#stopBtn { background: #a22; color: #fff; }
+button:disabled { opacity: 0.4; cursor: default; }
+#status { padding: 8px; margin: 16px 0; border-radius: 4px; font-size: 13px; }
+#status.running { background: #1a3a1a; border: 1px solid #2a2; }
+#status.stopped { background: #3a1a1a; border: 1px solid #a22; }
+#logs { background: #0a0a0a; border: 1px solid #222; padding: 8px; margin-top: 16px; height: 200px; overflow-y: auto; font-size: 11px; color: #666; white-space: pre-wrap; }
+.range-group { display: flex; gap: 8px; align-items: center; }
+.range-group input[type=range] { flex: 1; }
+.range-group .val { min-width: 50px; text-align: right; color: #2a2; font-size: 14px; }
+input[type=range] { -webkit-appearance: none; background: #333; height: 6px; border-radius: 3px; }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #2a2; border-radius: 50%; cursor: pointer; }
+.row { display: flex; gap: 12px; }
+.row > div { flex: 1; }
+</style>
+</head>
+<body>
+
+<h1>Audio Router</h1>
+
+<div class="row">
+  <div>
+    <label>Full Range Output</label>
+    <select id="fullDevice"></select>
+  </div>
+  <div>
+    <label>Bass Output</label>
+    <select id="bassDevice"></select>
+  </div>
+</div>
+
+<label>Crossover Frequency</label>
+<div class="range-group">
+  <input type="range" id="cutoff" min="40" max="200" value="80">
+  <span class="val" id="cutoffVal">80 Hz</span>
+</div>
+
+<label>Sync Delay</label>
+<div class="range-group">
+  <input type="range" id="delay" min="0" max="500" value="150">
+  <span class="val" id="delayVal">150 ms</span>
+</div>
+
+<label>Sample Rate</label>
+<select id="rate">
+  <option value="44100">44100 Hz</option>
+  <option value="48000" selected>48000 Hz</option>
+</select>
+
+<label><input type="checkbox" id="mute" checked> Mute tapped audio (prevent echo)</label>
+
+<div id="status" class="stopped">Stopped</div>
+
+<div style="display:flex; gap:8px;">
+  <button id="startBtn" onclick="startRouter()">Start</button>
+  <button id="stopBtn" onclick="stopRouter()" disabled>Stop</button>
+</div>
+
+<div id="logs"></div>
+
+<script>
+let pollInterval = null;
+
+document.getElementById('cutoff').oninput = function() {
+  document.getElementById('cutoffVal').textContent = this.value + ' Hz';
+};
+document.getElementById('delay').oninput = function() {
+  document.getElementById('delayVal').textContent = this.value + ' ms';
+};
+
+async function loadDevices() {
+  const res = await fetch('/api/devices');
+  const devices = await res.json();
+  const fullSel = document.getElementById('fullDevice');
+  const bassSel = document.getElementById('bassDevice');
+  fullSel.innerHTML = '';
+  bassSel.innerHTML = '';
+  devices.forEach(d => {
+    const opt1 = new Option(d.name, d.id);
+    const opt2 = new Option(d.name, d.id);
+    fullSel.appendChild(opt1);
+    bassSel.appendChild(opt2);
+  });
+}
+
+async function updateStatus() {
+  const res = await fetch('/api/status');
+  const s = await res.json();
+  const el = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  if (s.running) {
+    el.className = 'running';
+    const c = s.config;
+    el.textContent = `Running — Full: ${c.full} | Bass: ${c.bass} | Cutoff: ${c.cutoff}Hz | Delay: ${c.delay}ms`;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    document.querySelectorAll('select, input[type=range], input[type=number]').forEach(el => el.disabled = true);
+  } else {
+    el.className = 'stopped';
+    el.textContent = s.error ? `Error: ${s.error}` : 'Stopped';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    document.querySelectorAll('select, input[type=range], input[type=number]').forEach(el => el.disabled = false);
+  }
+}
+
+async function startRouter() {
+  const body = {
+    full: parseInt(document.getElementById('fullDevice').value),
+    bass: parseInt(document.getElementById('bassDevice').value),
+    cutoff: parseInt(document.getElementById('cutoff').value),
+    delay: parseInt(document.getElementById('delay').value),
+    rate: parseInt(document.getElementById('rate').value),
+    mute: document.getElementById('mute').checked,
+  };
+  const res = await fetch('/api/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.error) {
+    document.getElementById('status').className = 'stopped';
+    document.getElementById('status').textContent = 'Error: ' + data.error;
+    return;
+  }
+  updateStatus();
+  startPollingLogs();
+}
+
+async function stopRouter() {
+  await fetch('/api/stop', {method: 'POST'});
+  updateStatus();
+  stopPollingLogs();
+}
+
+function startPollingLogs() {
+  if (pollInterval) return;
+  pollInterval = setInterval(async () => {
+    const res = await fetch('/api/logs');
+    const data = await res.json();
+    if (data.line) {
+      const logs = document.getElementById('logs');
+      logs.textContent += data.line + '\n';
+      logs.scrollTop = logs.scrollHeight;
+    }
+  }, 500);
+}
+
+function stopPollingLogs() {
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+}
+
+loadDevices();
+updateStatus();
+setInterval(updateStatus, 2000);
+</script>
+
+</body>
+</html>
