@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Web GUI for Audio Router."""
 
+import math
 import os
 import select
 import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
+import numpy as np
+import sounddevice as sd
 from flask import Flask, jsonify, render_template, request
 
 ROUTER_DIR = Path(__file__).parent.parent
@@ -20,6 +24,17 @@ app = Flask(__name__, template_folder=str(ROUTER_DIR / "web" / "templates"))
 router_process = None
 router_lock = threading.Lock()
 router_status = {"running": False, "pid": None, "error": None}
+
+metronome_thread = None
+metronome_lock = threading.Lock()
+metronome_running = False
+metronome_config = {
+    "bpm": 120,
+    "full_device": None,
+    "bass_device": None,
+    "full_volume": 0.8,
+    "bass_volume": 0.8,
+}
 
 
 def get_devices():
@@ -39,6 +54,62 @@ def get_devices():
                 }
             )
     return devices
+
+
+def generate_click(sample_rate=48000, duration_ms=50, freq=1000):
+    t = np.linspace(0, duration_ms / 1000, int(sample_rate * duration_ms / 1000), False)
+    click = np.sin(2 * np.pi * freq * t)
+    envelope = np.exp(-t * 80)
+    return (click * envelope).astype(np.float32)
+
+
+def metronome_loop():
+    global metronome_running
+    sample_rate = 48000
+    click = generate_click(sample_rate)
+    click_bass = generate_click(sample_rate, freq=200)
+
+    full_stream = None
+    bass_stream = None
+
+    try:
+        full_stream = sd.OutputStream(
+            device=metronome_config["full_device"],
+            samplerate=sample_rate,
+            channels=1,
+            latency="low",
+        )
+        bass_stream = sd.OutputStream(
+            device=metronome_config["bass_device"],
+            samplerate=sample_rate,
+            channels=1,
+            latency="low",
+        )
+        full_stream.start()
+        bass_stream.start()
+
+        beat = 0
+        while metronome_running:
+            interval = 60.0 / metronome_config["bpm"]
+            vol = metronome_config["full_volume"]
+            bass_vol = metronome_config["bass_volume"]
+
+            accent = 1.5 if beat % 4 == 0 else 1.0
+
+            full_stream.write(click.reshape(-1, 1) * vol * accent)
+            bass_stream.write(click_bass.reshape(-1, 1) * bass_vol * accent)
+
+            beat += 1
+            time.sleep(interval)
+    except Exception:
+        pass
+    finally:
+        if full_stream:
+            full_stream.stop()
+            full_stream.close()
+        if bass_stream:
+            bass_stream.stop()
+            bass_stream.close()
 
 
 @app.route("/")
@@ -118,7 +189,7 @@ def api_start():
                 },
             }
             return jsonify({"ok": True, "pid": router_process.pid})
-        except Exception as e:
+        except Exception:
             router_status["error"] = "Failed to start router"
             return jsonify({"error": "Failed to start router"}), 500
 
@@ -157,6 +228,69 @@ def api_logs():
         except Exception:
             pass
     return jsonify({"line": None})
+
+
+@app.route("/api/metronome/status")
+def api_metronome_status():
+    return jsonify(
+        {
+            "running": metronome_running,
+            "bpm": metronome_config["bpm"],
+            "full_device": metronome_config["full_device"],
+            "bass_device": metronome_config["bass_device"],
+            "full_volume": metronome_config["full_volume"],
+            "bass_volume": metronome_config["bass_volume"],
+        }
+    )
+
+
+@app.route("/api/metronome/start", methods=["POST"])
+def api_metronome_start():
+    global metronome_thread, metronome_running
+
+    with metronome_lock:
+        if metronome_running:
+            return jsonify({"error": "Already running"}), 400
+
+        data = request.get_json(force=True, silent=True) or {}
+        metronome_config["bpm"] = data.get("bpm", 120)
+        metronome_config["full_device"] = data.get("full_device")
+        metronome_config["bass_device"] = data.get("bass_device")
+        metronome_config["full_volume"] = data.get("full_volume", 0.8)
+        metronome_config["bass_volume"] = data.get("bass_volume", 0.8)
+
+        if (
+            metronome_config["full_device"] is None
+            or metronome_config["bass_device"] is None
+        ):
+            return jsonify({"error": "full_device and bass_device required"}), 400
+
+        metronome_running = True
+        metronome_thread = threading.Thread(target=metronome_loop, daemon=True)
+        metronome_thread.start()
+        return jsonify({"ok": True})
+
+
+@app.route("/api/metronome/stop", methods=["POST"])
+def api_metronome_stop():
+    global metronome_running
+
+    with metronome_lock:
+        if not metronome_running:
+            return jsonify({"error": "Not running"}), 400
+        metronome_running = False
+        return jsonify({"ok": True})
+
+
+@app.route("/api/metronome/bpm", methods=["POST"])
+def api_metronome_bpm():
+    global metronome_running
+    data = request.get_json(force=True, silent=True) or {}
+    bpm = data.get("bpm")
+    if bpm is None:
+        return jsonify({"error": "bpm required"}), 400
+    metronome_config["bpm"] = int(bpm)
+    return jsonify({"ok": True, "bpm": metronome_config["bpm"]})
 
 
 def main():

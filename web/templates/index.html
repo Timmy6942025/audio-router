@@ -8,22 +8,30 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, monospace; padding: 20px; max-width: 600px; margin: 0 auto; background: #111; color: #eee; }
 h1 { font-size: 18px; margin-bottom: 20px; }
+h2 { font-size: 14px; margin: 24px 0 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #222; padding-bottom: 4px; }
 label { display: block; margin: 12px 0 4px; font-size: 13px; color: #888; }
 select, input[type=number] { width: 100%; padding: 8px; background: #222; border: 1px solid #333; color: #eee; border-radius: 4px; font-size: 14px; }
 input[type=checkbox] { width: auto; }
 button { padding: 10px 20px; border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }
 #startBtn { background: #2a2; color: #fff; }
 #stopBtn { background: #a22; color: #fff; }
+#metroStartBtn { background: #28a; color: #fff; }
+#metroStopBtn { background: #a22; color: #fff; }
 button:disabled { opacity: 0.4; cursor: default; }
 #status { padding: 8px; margin: 16px 0; border-radius: 4px; font-size: 13px; }
 #status.running { background: #1a3a1a; border: 1px solid #2a2; }
 #status.stopped { background: #3a1a1a; border: 1px solid #a22; }
+#metroStatus { padding: 8px; margin: 12px 0; border-radius: 4px; font-size: 13px; }
+#metroStatus.running { background: #1a2a3a; border: 1px solid #28a; }
+#metroStatus.stopped { background: #222; border: 1px solid #333; }
 #logs { background: #0a0a0a; border: 1px solid #222; padding: 8px; margin-top: 16px; height: 200px; overflow-y: auto; font-size: 11px; color: #666; white-space: pre-wrap; }
 .range-group { display: flex; gap: 8px; align-items: center; }
 .range-group input[type=range] { flex: 1; }
 .range-group .val { min-width: 50px; text-align: right; color: #2a2; font-size: 14px; }
 input[type=range] { -webkit-appearance: none; background: #333; height: 6px; border-radius: 3px; }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; background: #2a2; border-radius: 50%; cursor: pointer; }
+.metro-range input[type=range]::-webkit-slider-thumb { background: #28a; }
+.metro-range .val { color: #28a; }
 .row { display: flex; gap: 12px; }
 .row > div { flex: 1; }
 </style>
@@ -72,6 +80,44 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px;
 
 <div id="logs"></div>
 
+<h2>Metronome</h2>
+
+<div class="row">
+  <div>
+    <label>Full Range Device</label>
+    <select id="metroFullDevice"></select>
+  </div>
+  <div>
+    <label>Bass Device</label>
+    <select id="metroBassDevice"></select>
+  </div>
+</div>
+
+<label>BPM</label>
+<div class="range-group metro-range">
+  <input type="range" id="bpm" min="30" max="300" value="120">
+  <span class="val" id="bpmVal">120</span>
+</div>
+
+<label>Full Volume</label>
+<div class="range-group metro-range">
+  <input type="range" id="fullVol" min="0" max="100" value="80">
+  <span class="val" id="fullVolVal">80%</span>
+</div>
+
+<label>Bass Volume</label>
+<div class="range-group metro-range">
+  <input type="range" id="bassVol" min="0" max="100" value="80">
+  <span class="val" id="bassVolVal">80%</span>
+</div>
+
+<div id="metroStatus" class="stopped">Stopped</div>
+
+<div style="display:flex; gap:8px;">
+  <button id="metroStartBtn" onclick="startMetronome()">Start</button>
+  <button id="metroStopBtn" onclick="stopMetronome()" disabled>Stop</button>
+</div>
+
 <script>
 let pollInterval = null;
 
@@ -81,19 +127,33 @@ document.getElementById('cutoff').oninput = function() {
 document.getElementById('delay').oninput = function() {
   document.getElementById('delayVal').textContent = this.value + ' ms';
 };
+document.getElementById('bpm').oninput = function() {
+  document.getElementById('bpmVal').textContent = this.value;
+  if (metronomeRunning) updateBpm(parseInt(this.value));
+};
+document.getElementById('fullVol').oninput = function() {
+  document.getElementById('fullVolVal').textContent = this.value + '%';
+};
+document.getElementById('bassVol').oninput = function() {
+  document.getElementById('bassVolVal').textContent = this.value + '%';
+};
+
+let metronomeRunning = false;
 
 async function loadDevices() {
   const res = await fetch('/api/devices');
   const devices = await res.json();
   const fullSel = document.getElementById('fullDevice');
   const bassSel = document.getElementById('bassDevice');
-  fullSel.innerHTML = '';
-  bassSel.innerHTML = '';
-  devices.forEach(d => {
-    const opt1 = new Option(d.name, d.id);
-    const opt2 = new Option(d.name, d.id);
-    fullSel.appendChild(opt1);
-    bassSel.appendChild(opt2);
+  const metroFullSel = document.getElementById('metroFullDevice');
+  const metroBassSel = document.getElementById('metroBassDevice');
+  [fullSel, metroFullSel].forEach(sel => {
+    sel.innerHTML = '';
+    devices.forEach(d => sel.appendChild(new Option(d.name, d.id)));
+  });
+  [bassSel, metroBassSel].forEach(sel => {
+    sel.innerHTML = '';
+    devices.forEach(d => sel.appendChild(new Option(d.name, d.id)));
   });
 }
 
@@ -109,13 +169,13 @@ async function updateStatus() {
     el.textContent = `Running — Full: ${c.full} | Bass: ${c.bass} | Cutoff: ${c.cutoff}Hz | Delay: ${c.delay}ms`;
     startBtn.disabled = true;
     stopBtn.disabled = false;
-    document.querySelectorAll('select, input[type=range], input[type=number]').forEach(el => el.disabled = true);
+    document.querySelectorAll('#fullDevice, #bassDevice, #cutoff, #delay, #rate, #mute').forEach(el => el.disabled = true);
   } else {
     el.className = 'stopped';
     el.textContent = s.error ? `Error: ${s.error}` : 'Stopped';
     startBtn.disabled = false;
     stopBtn.disabled = true;
-    document.querySelectorAll('select, input[type=range], input[type=number]').forEach(el => el.disabled = false);
+    document.querySelectorAll('#fullDevice, #bassDevice, #cutoff, #delay, #rate, #mute').forEach(el => el.disabled = false);
   }
 }
 
@@ -169,9 +229,70 @@ function stopPollingLogs() {
   }
 }
 
+async function updateMetronomeStatus() {
+  const res = await fetch('/api/metronome/status');
+  const s = await res.json();
+  const el = document.getElementById('metroStatus');
+  const startBtn = document.getElementById('metroStartBtn');
+  const stopBtn = document.getElementById('metroStopBtn');
+  metronomeRunning = s.running;
+  if (s.running) {
+    el.className = 'running';
+    el.textContent = `Running — ${s.bpm} BPM | Full: ${s.full_device} | Bass: ${s.bass_device}`;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    document.getElementById('metroFullDevice').disabled = true;
+    document.getElementById('metroBassDevice').disabled = true;
+  } else {
+    el.className = 'stopped';
+    el.textContent = 'Stopped';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    document.getElementById('metroFullDevice').disabled = false;
+    document.getElementById('metroBassDevice').disabled = false;
+  }
+}
+
+async function startMetronome() {
+  const body = {
+    bpm: parseInt(document.getElementById('bpm').value),
+    full_device: parseInt(document.getElementById('metroFullDevice').value),
+    bass_device: parseInt(document.getElementById('metroBassDevice').value),
+    full_volume: parseInt(document.getElementById('fullVol').value) / 100,
+    bass_volume: parseInt(document.getElementById('bassVol').value) / 100,
+  };
+  const res = await fetch('/api/metronome/start', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (data.error) {
+    document.getElementById('metroStatus').className = 'stopped';
+    document.getElementById('metroStatus').textContent = 'Error: ' + data.error;
+    return;
+  }
+  updateMetronomeStatus();
+}
+
+async function stopMetronome() {
+  await fetch('/api/metronome/stop', {method: 'POST'});
+  updateMetronomeStatus();
+}
+
+async function updateBpm(bpm) {
+  await fetch('/api/metronome/bpm', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({bpm}),
+  });
+}
+
 loadDevices();
 updateStatus();
+updateMetronomeStatus();
 setInterval(updateStatus, 2000);
+setInterval(updateMetronomeStatus, 2000);
 </script>
 
 </body>
