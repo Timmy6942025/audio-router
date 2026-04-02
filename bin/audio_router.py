@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Audio Router: Splits system audio into two outputs
-- Full range → MacBook Pro Speakers
-- Bass only (<80Hz) → WKing D8 Mini (Bluetooth speaker)
-- Configurable delay to sync Bluetooth latency
-
-Uses audiotee (Core Audio Taps API) for system audio capture — no sudo needed.
-"""
+"""Audio Router: splits system audio into full-range + bass-only outputs."""
 
 import numpy as np
 import sounddevice as sd
@@ -18,7 +11,6 @@ import argparse
 import sys
 import os
 import json
-import time
 
 
 DEFAULT_BASS_CUTOFF = 80
@@ -50,9 +42,9 @@ class AudioteeCapture:
         self.sample_rate = sample_rate
         self.mute = mute
         self.proc = None
-        self.pcm_queue = queue.Queue(maxsize=16)
+        self.pcm_queue = queue.Queue(maxsize=32)
         self.running = False
-        self._partial_buffer = b""
+        self._partial = b""
 
     def start(self):
         cmd = [AUDIOTEE_PATH, "--stereo"]
@@ -69,23 +61,15 @@ class AudioteeCapture:
         )
 
         self.running = True
-        self.read_thread = threading.Thread(target=self._read_pcm, daemon=True)
-        self.read_thread.start()
-
-        metadata_line = self._read_metadata()
-        if metadata_line:
-            return metadata_line
-        return None
+        threading.Thread(target=self._read_pcm, daemon=True).start()
+        return self._read_metadata()
 
     def _read_metadata(self):
         import select
 
-        stderr_fd = self.proc.stderr.fileno()
-        deadline = threading.Event()
-        deadline.wait(timeout=5.0)
-
+        fd = self.proc.stderr.fileno()
         while self.running and self.proc.poll() is None:
-            ready, _, _ = select.select([stderr_fd], [], [], 0.5)
+            ready, _, _ = select.select([fd], [], [], 0.5)
             if not ready:
                 continue
             line = self.proc.stderr.readline()
@@ -103,7 +87,7 @@ class AudioteeCapture:
 
     def _read_pcm(self):
         while self.running:
-            chunk = self.proc.stdout.read(8192)
+            chunk = self.proc.stdout.read(16384)
             if not chunk:
                 break
             try:
@@ -112,27 +96,17 @@ class AudioteeCapture:
                 self.pcm_queue.get_nowait()
                 self.pcm_queue.put_nowait(chunk)
 
-    def read(self, min_bytes=8192):
+    def read(self, min_bytes=16384):
         while self.running:
-            if self._partial_buffer:
-                chunk = self._partial_buffer
-                self._partial_buffer = b""
-            else:
-                try:
-                    chunk = self.pcm_queue.get(timeout=1.0)
-                except queue.Empty:
-                    return None
-
-            if chunk is None:
-                continue
-
-            if len(chunk) >= min_bytes:
-                result = chunk[:min_bytes]
-                self._partial_buffer = chunk[min_bytes:]
+            if len(self._partial) >= min_bytes:
+                result = self._partial[:min_bytes]
+                self._partial = self._partial[min_bytes:]
                 return result
-            else:
-                self._partial_buffer += chunk
-
+            try:
+                chunk = self.pcm_queue.get(timeout=1.0)
+                self._partial += chunk
+            except queue.Empty:
+                continue
         return None
 
     def stop(self):
@@ -143,6 +117,27 @@ class AudioteeCapture:
                 self.proc.wait(timeout=3)
             except Exception:
                 self.proc.kill()
+
+
+class DelayLine:
+    def __init__(self, max_samples, channels=2):
+        self.buffer = np.zeros((max_samples, channels), dtype=np.float32)
+        self.max_samples = max_samples
+        self.write_pos = 0
+        self.delay_samples = 1
+
+    def set_delay(self, samples):
+        self.delay_samples = max(1, samples)
+
+    def process(self, audio):
+        n = audio.shape[0]
+        output = np.zeros_like(audio)
+        for i in range(n):
+            read_pos = (self.write_pos - self.delay_samples + i) % self.max_samples
+            output[i] = self.buffer[read_pos]
+            self.buffer[(self.write_pos + i) % self.max_samples] = audio[i]
+        self.write_pos = (self.write_pos + n) % self.max_samples
+        return output
 
 
 class AudioRouter:
@@ -157,11 +152,11 @@ class AudioRouter:
     ):
         self.sample_rate = sample_rate
         self.bass_cutoff = bass_cutoff
-        self.delay_samples = max(1, int(delay_ms * sample_rate / 1000))
+        self.delay_ms = delay_ms
 
-        self.delay_buffer = np.zeros((self.delay_samples, 2))
-        self.delay_write_pos = 0
-        self.delay_read_pos = 0
+        max_delay = int(1000 * sample_rate / 1000)
+        self.delay = DelayLine(max_delay)
+        self.delay.set_delay(int(delay_ms * sample_rate / 1000))
 
         self.sos = butter(2, bass_cutoff, btype="low", fs=sample_rate, output="sos")
         self.zi = None
@@ -170,101 +165,51 @@ class AudioRouter:
         self.bass_output_device = bass_output_device
         self.mute = mute
 
-        self.full_queue = queue.Queue(maxsize=8)
-        self.bass_queue = queue.Queue(maxsize=8)
+        self.full_queue = queue.Queue(maxsize=16)
+        self.bass_queue = queue.Queue(maxsize=16)
         self.running = False
 
-        self._print_config(
-            full_output_device, bass_output_device, bass_cutoff, delay_ms, sample_rate
-        )
-
-    def _device_name(self, device_id):
-        try:
-            return sd.query_devices(device_id)["name"]
-        except Exception:
-            return f"Device {device_id}"
-
-    def _print_config(self, full, bass, cutoff, delay, rate):
-        print(f"Full Output:    {self._device_name(full)}")
-        print(f"Bass Output:    {self._device_name(bass)}")
-        print(f"Bass Cutoff:    {cutoff} Hz")
-        print(f"Sync Delay:     {delay} ms ({self.delay_samples} samples)")
-        print(f"Sample Rate:    {rate} Hz")
-        print(f"Mute Tapped:    {self.mute}")
+        print(f"Full Output:    {self._dname(full_output_device)}")
+        print(f"Bass Output:    {self._dname(bass_output_device)}")
+        print(f"Bass Cutoff:    {bass_cutoff} Hz")
+        print(f"Sync Delay:     {delay_ms} ms")
+        print(f"Sample Rate:    {sample_rate} Hz")
+        print(f"Mute Tapped:    {mute}")
         print()
 
-    def _resize_delay_buffer(self, new_samples):
-        if new_samples == self.delay_samples:
-            return
-
-        old_buffer = self.delay_buffer.copy()
-        old_write = self.delay_write_pos
-        old_read = self.delay_read_pos
-        old_len = self.delay_samples
-
-        self.delay_samples = new_samples
-        self.delay_buffer = np.zeros((new_samples, 2))
-
-        count = min(old_write - old_read, new_samples)
-        for i in range(count):
-            src = (old_read + i) % old_len
-            dst = i % new_samples
-            self.delay_buffer[dst] = old_buffer[src]
-
-        self.delay_write_pos = count
-        self.delay_read_pos = 0
+    def _dname(self, did):
+        try:
+            return sd.query_devices(did)["name"]
+        except Exception:
+            return f"Device {did}"
 
     def process_chunk(self, audio):
-        live_delay_ms = _get_live_delay_ms()
-        live_samples = max(1, int(live_delay_ms * self.sample_rate / 1000))
-        self._resize_delay_buffer(live_samples)
+        live_ms = _get_live_delay_ms()
+        self.delay.set_delay(int(live_ms * self.sample_rate / 1000))
+
+        delayed_full = self.delay.process(audio)
 
         if self.zi is None:
-            self.zi = np.zeros((2, 2, audio.shape[1]))
-
-        bass = sosfilt(self.sos, audio, axis=0, zi=self.zi)[0]
-
-        delayed_full = self.delay_buffer[self.delay_read_pos % self.delay_samples]
-        self.delay_buffer[self.delay_write_pos % self.delay_samples] = audio
-        self.delay_write_pos += 1
-        self.delay_read_pos += 1
+            n_sections = self.sos.shape[0]
+            self.zi = np.zeros((n_sections, 2, 2))
+        bass = sosfilt(self.sos, audio, axis=0, zi=self.zi)[0].astype(np.float32)
 
         return delayed_full, bass
 
-    def full_output_thread(self):
+    def _output_thread(self, device_id, q):
         stream = sd.OutputStream(
-            device=self.full_output_device,
-            samplerate=self.sample_rate,
-            channels=2,
-            latency="low",
+            device=device_id, samplerate=self.sample_rate, channels=2, latency="low"
         )
         stream.start()
-
         try:
             while self.running:
-                chunk = self.full_queue.get(timeout=0.1)
+                try:
+                    chunk = q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
                 if chunk is None:
                     break
-                stream.write(chunk)
-        finally:
-            stream.stop()
-            stream.close()
-
-    def bass_output_thread(self):
-        stream = sd.OutputStream(
-            device=self.bass_output_device,
-            samplerate=self.sample_rate,
-            channels=2,
-            latency="low",
-        )
-        stream.start()
-
-        try:
-            while self.running:
-                chunk = self.bass_queue.get(timeout=0.1)
-                if chunk is None:
-                    break
-                stream.write(chunk)
+                stream.write(np.ascontiguousarray(chunk))
         finally:
             stream.stop()
             stream.close()
@@ -273,136 +218,105 @@ class AudioRouter:
         self.running = True
 
         capture = AudioteeCapture(sample_rate=self.sample_rate, mute=self.mute)
-        print("Starting audiotee (Core Audio Taps)...")
-        metadata = capture.start()
-        if metadata:
+        print("Starting audiotee...")
+        meta = capture.start()
+        if meta:
             print(
-                f"Capture: {metadata.get('sample_rate')}Hz, {metadata.get('channels_per_frame')}ch, {metadata.get('encoding')}"
+                f"Capture: {meta.get('sample_rate')}Hz, {meta.get('channels_per_frame')}ch"
             )
-        print("Running. Press Ctrl+C to stop.\n")
+        print("Running. Ctrl+C to stop.\n")
 
-        full_thread = threading.Thread(target=self.full_output_thread, daemon=True)
-        bass_thread = threading.Thread(target=self.bass_output_thread, daemon=True)
-        full_thread.start()
-        bass_thread.start()
+        ft = threading.Thread(
+            target=self._output_thread,
+            args=(self.full_output_device, self.full_queue),
+            daemon=True,
+        )
+        bt = threading.Thread(
+            target=self._output_thread,
+            args=(self.bass_output_device, self.bass_queue),
+            daemon=True,
+        )
+        ft.start()
+        bt.start()
 
-        bytes_per_sample = 4
-        bytes_per_chunk = int(self.sample_rate * 0.02) * 2 * bytes_per_sample
+        bps = 4
+        spc = int(self.sample_rate * 0.05)
+        bpc = spc * 2 * bps
 
         try:
             while self.running:
-                raw = capture.read(bytes_per_chunk)
+                raw = capture.read(bpc)
                 if raw is None:
                     continue
-
                 audio = np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)
-
-                delayed_full, bass = self.process_chunk(audio)
-
+                full, bass = self.process_chunk(audio)
                 try:
-                    self.full_queue.put_nowait(delayed_full)
+                    self.full_queue.put_nowait(full)
                 except queue.Full:
                     self.full_queue.get_nowait()
-                    self.full_queue.put_nowait(delayed_full)
-
+                    self.full_queue.put_nowait(full)
                 try:
                     self.bass_queue.put_nowait(bass)
                 except queue.Full:
                     self.bass_queue.get_nowait()
                     self.bass_queue.put_nowait(bass)
-
         except KeyboardInterrupt:
             print("\nStopping...")
         finally:
             self.running = False
-            try:
-                self.full_queue.put_nowait(None)
-            except Exception:
-                pass
-            try:
-                self.bass_queue.put_nowait(None)
-            except Exception:
-                pass
-            full_thread.join(timeout=2)
-            bass_thread.join(timeout=2)
+            for q in [self.full_queue, self.bass_queue]:
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
+            ft.join(timeout=2)
+            bt.join(timeout=2)
             capture.stop()
 
 
 def list_devices():
-    devices = sd.query_devices()
-    print(f"{'ID':<4} {'Name':<30} {'In':<4} {'Out':<4} {'Rate':<6}")
-    print("-" * 52)
-    for i, d in enumerate(devices):
-        name = d["name"][:28]
-        rate = int(d["default_samplerate"]) if d["default_samplerate"] else "N/A"
-        print(
-            f"{i:<4} {name:<30} {d['max_input_channels']:<4} {d['max_output_channels']:<4} {rate:<6}"
-        )
-    print()
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_output_channels"] > 0:
+            rate = int(d["default_samplerate"]) if d["default_samplerate"] else "N/A"
+            print(
+                f"{i:<4} {d['name'][:30]:<30} out={d['max_output_channels']}  rate={rate}"
+            )
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Audio Router - Split system audio into full-range + bass-only outputs"
-    )
-    parser.add_argument(
-        "--list", action="store_true", help="List available audio devices"
-    )
-    parser.add_argument("--full", type=int, help="Full-range output device ID")
-    parser.add_argument(
-        "--bass", type=int, help="Bass-only output device ID (WKing D8 Mini)"
-    )
-    parser.add_argument(
-        "--cutoff",
-        type=int,
-        default=DEFAULT_BASS_CUTOFF,
-        help="Bass cutoff frequency in Hz (default: 80)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=int,
-        default=DEFAULT_DELAY_MS,
-        help="Delay in ms to sync Bluetooth latency (default: 150)",
-    )
-    parser.add_argument(
-        "--rate",
-        type=int,
-        default=DEFAULT_SAMPLE_RATE,
-        help="Sample rate (default: 48000)",
-    )
-    parser.add_argument(
-        "--no-mute",
-        action="store_true",
-        help="Don't mute the tapped audio (you'll hear it from original source)",
-    )
-
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Audio Router")
+    p.add_argument("--list", action="store_true")
+    p.add_argument("--full", type=int)
+    p.add_argument("--bass", type=int)
+    p.add_argument("--cutoff", type=int, default=DEFAULT_BASS_CUTOFF)
+    p.add_argument("--delay", type=int, default=DEFAULT_DELAY_MS)
+    p.add_argument("--rate", type=int, default=DEFAULT_SAMPLE_RATE)
+    p.add_argument("--no-mute", action="store_true")
+    args = p.parse_args()
 
     if args.list:
         list_devices()
         return
 
     if args.full is None or args.bass is None:
-        parser.print_help()
-        print("\nError: --full and --bass are required.")
-        print("Use --list to see available devices.\n")
+        p.print_help()
+        print("\nError: --full and --bass required.")
         sys.exit(1)
 
     _ensure_config_dir()
-    config = _read_config()
-    config["delay_ms"] = args.delay
+    cfg = _read_config()
+    cfg["delay_ms"] = args.delay
     with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f)
+        json.dump(cfg, f)
 
-    router = AudioRouter(
+    AudioRouter(
         full_output_device=args.full,
         bass_output_device=args.bass,
         sample_rate=args.rate,
         bass_cutoff=args.cutoff,
         delay_ms=args.delay,
         mute=not args.no_mute,
-    )
-    router.run()
+    ).run()
 
 
 if __name__ == "__main__":
