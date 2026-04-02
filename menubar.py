@@ -2,10 +2,13 @@
 """Menu bar app for Audio Router."""
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
-from urllib.error import URLError
 
 from AppKit import (
     NSApplication,
@@ -373,7 +376,31 @@ class MenuBarApp(NSObject):
             )
 
 
+def wait_for_server(base_url, timeout=10):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            urllib.request.urlopen(f"{base_url}/api/status", timeout=1)
+            return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+
+def start_flask_server():
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    flask_app = os.path.join(app_dir, "web", "app.py")
+    subprocess.Popen(
+        [sys.executable, flask_app],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return wait_for_server(API_BASE)
+
+
 def main():
+    start_flask_server()
+
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
     delegate = MenuBarApp.alloc().init()
