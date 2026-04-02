@@ -6,7 +6,6 @@ import sounddevice as sd
 from scipy.signal import butter, sosfilt
 import subprocess
 import threading
-import queue
 import argparse
 import sys
 import os
@@ -48,88 +47,6 @@ class DelayConfig:
         return self._delay_ms
 
 
-class AudioteeCapture:
-    def __init__(self, sample_rate=DEFAULT_SAMPLE_RATE, mute=True):
-        self.sample_rate = sample_rate
-        self.mute = mute
-        self.proc = None
-        self.pcm_queue = queue.Queue(maxsize=32)
-        self.running = False
-        self._partial = b""
-
-    def start(self):
-        cmd = [AUDIOTEE_PATH, "--stereo"]
-        if self.mute:
-            cmd.append("--mute")
-        if self.sample_rate != 48000:
-            cmd.extend(["--sample-rate", str(self.sample_rate)])
-
-        self.proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-        )
-
-        self.running = True
-        threading.Thread(target=self._read_pcm, daemon=True).start()
-        return self._read_metadata()
-
-    def _read_metadata(self):
-        import select
-
-        fd = self.proc.stderr.fileno()
-        while self.running and self.proc.poll() is None:
-            ready, _, _ = select.select([fd], [], [], 0.5)
-            if not ready:
-                continue
-            line = self.proc.stderr.readline()
-            if not line:
-                break
-            try:
-                msg = json.loads(line.decode())
-                if msg.get("message_type") == "metadata":
-                    return msg.get("data", {})
-                if msg.get("message_type") == "stream_start":
-                    return None
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-        return None
-
-    def _read_pcm(self):
-        while self.running:
-            chunk = self.proc.stdout.read(16384)
-            if not chunk:
-                break
-            try:
-                self.pcm_queue.put_nowait(chunk)
-            except queue.Full:
-                self.pcm_queue.get_nowait()
-                self.pcm_queue.put_nowait(chunk)
-
-    def read(self, min_bytes=16384):
-        while self.running:
-            if len(self._partial) >= min_bytes:
-                result = self._partial[:min_bytes]
-                self._partial = self._partial[min_bytes:]
-                return result
-            try:
-                chunk = self.pcm_queue.get(timeout=1.0)
-                self._partial += chunk
-            except queue.Empty:
-                continue
-        return None
-
-    def stop(self):
-        self.running = False
-        if self.proc:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except Exception:
-                self.proc.kill()
-
-
 class AudioRouter:
     def __init__(
         self,
@@ -155,9 +72,10 @@ class AudioRouter:
         self.bass_output_device = bass_output_device
         self.mute = mute
 
-        self.full_queue = queue.Queue(maxsize=8)
-        self.bass_queue = queue.Queue(maxsize=8)
+        self.full_stream = None
+        self.bass_stream = None
         self.running = False
+        self.audiotee_proc = None
 
         print(f"Full Output:    {self._dname(full_output_device)}")
         print(f"Bass Output:    {self._dname(bass_output_device)}")
@@ -198,53 +116,85 @@ class AudioRouter:
 
         return delayed_full, bass
 
-    def _output_thread(self, device_id, q):
-        stream = sd.OutputStream(
-            device=device_id,
-            samplerate=self.sample_rate,
-            channels=2,
-            latency="low",
-            blocksize=480,
+    def start_audiotee(self):
+        cmd = [AUDIOTEE_PATH, "--stereo"]
+        if self.mute:
+            cmd.append("--mute")
+        if self.sample_rate != 48000:
+            cmd.extend(["--sample-rate", str(self.sample_rate)])
+
+        self.audiotee_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
         )
-        stream.start()
-        try:
-            while self.running:
-                try:
-                    chunk = q.get(timeout=0.05)
-                except queue.Empty:
-                    stream.write(np.zeros((480, 2), dtype=np.float32))
+
+        import select, fcntl
+
+        fd = self.audiotee_proc.stderr.fileno()
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        for _ in range(20):
+            try:
+                line = self.audiotee_proc.stderr.readline()
+                if line:
+                    msg = json.loads(line.decode())
+                    if msg.get("message_type") == "metadata":
+                        meta = msg.get("data", {})
+                        print(
+                            f"Capture: {meta.get('sample_rate')}Hz, {meta.get('channels_per_frame')}ch"
+                        )
+                        return True
+                    if msg.get("message_type") == "stream_start":
+                        return True
+            except:
+                pass
+            time.sleep(0.2)
+        return False
+
+    def read_audio(self, min_bytes):
+        partial = b""
+        while self.running:
+            if len(partial) >= min_bytes:
+                result = partial[:min_bytes]
+                partial = partial[min_bytes:]
+                return result
+
+            try:
+                chunk = self.audiotee_proc.stdout.read(16384)
+                if not chunk:
+                    time.sleep(0.01)
                     continue
-                if chunk is None:
-                    break
-                stream.write(np.ascontiguousarray(chunk))
-        finally:
-            stream.stop()
-            stream.close()
+                partial += chunk
+            except Exception:
+                time.sleep(0.01)
+        return None
 
     def run(self):
         self.running = True
 
-        capture = AudioteeCapture(sample_rate=self.sample_rate, mute=self.mute)
         print("Starting audiotee...")
-        meta = capture.start()
-        if meta:
-            print(
-                f"Capture: {meta.get('sample_rate')}Hz, {meta.get('channels_per_frame')}ch"
-            )
+        if not self.start_audiotee():
+            print("Failed to start audiotee")
+            return
         print("Running. Ctrl+C to stop.\n")
 
-        ft = threading.Thread(
-            target=self._output_thread,
-            args=(self.full_output_device, self.full_queue),
-            daemon=True,
+        self.full_stream = sd.OutputStream(
+            device=self.full_output_device,
+            samplerate=self.sample_rate,
+            channels=2,
+            latency="low",
         )
-        bt = threading.Thread(
-            target=self._output_thread,
-            args=(self.bass_output_device, self.bass_queue),
-            daemon=True,
+        self.bass_stream = sd.OutputStream(
+            device=self.bass_output_device,
+            samplerate=self.sample_rate,
+            channels=2,
+            latency="low",
         )
-        ft.start()
-        bt.start()
+        self.full_stream.start()
+        self.bass_stream.start()
 
         bps = 4
         spc = 480
@@ -252,33 +202,29 @@ class AudioRouter:
 
         try:
             while self.running:
-                raw = capture.read(bpc)
+                raw = self.read_audio(bpc)
                 if raw is None:
                     continue
                 audio = np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)
                 full, bass = self.process_chunk(audio)
-                try:
-                    self.full_queue.put_nowait(full)
-                except queue.Full:
-                    self.full_queue.get_nowait()
-                    self.full_queue.put_nowait(full)
-                try:
-                    self.bass_queue.put_nowait(bass)
-                except queue.Full:
-                    self.bass_queue.get_nowait()
-                    self.bass_queue.put_nowait(bass)
+                self.full_stream.write(np.ascontiguousarray(full))
+                self.bass_stream.write(np.ascontiguousarray(bass))
         except KeyboardInterrupt:
             print("\nStopping...")
         finally:
             self.running = False
-            for q in [self.full_queue, self.bass_queue]:
+            if self.full_stream:
+                self.full_stream.stop()
+                self.full_stream.close()
+            if self.bass_stream:
+                self.bass_stream.stop()
+                self.bass_stream.close()
+            if self.audiotee_proc:
+                self.audiotee_proc.terminate()
                 try:
-                    q.put_nowait(None)
+                    self.audiotee_proc.wait(timeout=3)
                 except Exception:
-                    pass
-            ft.join(timeout=2)
-            bt.join(timeout=2)
-            capture.stop()
+                    self.audiotee_proc.kill()
 
 
 def list_devices():
